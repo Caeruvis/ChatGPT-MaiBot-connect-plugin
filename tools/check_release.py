@@ -74,8 +74,9 @@ def check(*, release: bool = False) -> list[str]:
             errors.append("发布前必须填写作者")
         if "example.invalid" in json.dumps(manifest):
             errors.append("发布前必须替换 example.invalid 元信息")
-        if manifest["id"].startswith("local."):
-            errors.append("发布前必须确认正式插件 ID 并安排数据迁移")
+        # Keep the existing ID so upgrades can find the authorized account data.
+        if manifest["id"] != "local.chatgpt-maibot-connect":
+            errors.append("发布时必须保留现有插件 ID，以便已有实例继续读取授权数据")
     return errors
 
 
