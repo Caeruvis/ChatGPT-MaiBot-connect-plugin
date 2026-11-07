@@ -1,0 +1,18 @@
+# Reference only. Runner generates config.toml from config_model.
+[plugin]
+config_version = "0.1.0"
+enabled = true
+oauth_timeout_seconds = 300
+request_timeout_seconds = 240
+admin_stream_ids = []
+enable_web_search = false
+enable_tool_controls = false
+
+# 与聊天 enable_web_search 独立；专用搜索请求强制使用内置联网工具。
+[web]
+enabled = false
+model = "" # 填写 models 命令返回的账号可见 slug
+fetch_timeout_seconds = 30
+# MaiBot 1.4.0 的 DeepSeek 兼容模式使用本机端口和独立密钥。
+deepseek_port = 0 # 启用时可填 18765
+deepseek_api_key = "" # 与 model_config.toml 中 gpt_builtin 的 api_key 相同

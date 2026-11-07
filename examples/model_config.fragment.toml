@@ -1,0 +1,43 @@
+# Merge selected sections into MaiBot's existing config/model_config.toml.
+# Run the local helper's `models` command before replacing this placeholder.
+[[api_providers]]
+name = "OpenAI-ChatGPT-Plan"
+base_url = "https://api.openai.com/v1"
+api_key = ""
+auth_type = "none"
+client_type = "openai_chatgpt_plan_siwc"
+max_retry = 0
+timeout = 240
+retry_interval = 4
+
+[[models]]
+model_identifier = "<ACCOUNT_VISIBLE_MODEL_SLUG>"
+name = "chatgpt-plan-main"
+api_provider = "OpenAI-ChatGPT-Plan"
+model_type = "llm"
+visual = true
+send_temperature = false
+price_in = 0.0
+price_out = 0.0
+price_periods = []
+extra_params = { reasoning = { effort = "low" } }
+
+# Merge these values into your existing task sections; keep all other tasks.
+[model_task_config.replyer]
+model_list = ["chatgpt-plan-main"]
+max_tokens = 8192
+temperature = 0.7
+selection_strategy = "random"
+hard_timeout = 240.0
+
+[model_task_config.planner]
+model_list = ["chatgpt-plan-main"]
+max_tokens = 8192
+temperature = 0.7
+selection_strategy = "random"
+hard_timeout = 240.0
+
+[model_task_config.vlm]
+model_list = ["chatgpt-plan-main"]
+max_tokens = 8192
+hard_timeout = 240.0

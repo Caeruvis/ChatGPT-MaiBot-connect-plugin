@@ -1,0 +1,19 @@
+[project]
+name = "chatgpt-maibot-connect-plugin"
+version = "0.2.3"
+description = "MaiBot Responses provider with Sign in with ChatGPT"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+extend-exclude = ["host_backend"]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "ASYNC"]
+ignore = ["E501"]

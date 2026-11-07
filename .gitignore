@@ -1,0 +1,48 @@
+# 本机配置、ChatGPT 授权和密钥
+config.toml
+config.toml.backup.*
+config_back/
+/config/
+accounts.json
+host_id.txt
+.credentials.lock
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+
+# 运行数据、日志、部署记录和更新备份
+/data/
+/deployment/
+logs/
+*.log
+*.log.*
+*.sqlite
+*.sqlite3
+*.db
+.update-backups/
+.gpt-web-backups/
+.gpt-web-config-backups/
+
+# IDE 和操作系统
+.idea/
+.vscode/
+.DS_Store
+
+# Python 环境、测试缓存和构建产物
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+/build/
+/dist/

@@ -1,0 +1,595 @@
+--- a/src/config/config.py
++++ b/src/config/config.py
+@@ -75,7 +75,7 @@
+ LEGACY_ENV_PATH: Path = (PROJECT_ROOT / ".env").resolve().absolute()
+ MMC_VERSION: str = read_project_version(PROJECT_ROOT)
+ CONFIG_VERSION: str = "8.15.68"
+-MODEL_CONFIG_VERSION: str = "1.17.25"
++MODEL_CONFIG_VERSION: str = "1.17.26"
+ 
+ logger = get_logger("config")
+ 
+--- a/src/web_search/config.py
++++ b/src/web_search/config.py
+@@ -7,7 +7,7 @@
+ 
+ 
+ class WebServiceConfig(ConfigBase):
+-    adapter: Literal["deepseek", "tavily", "stepsearch_mcp", "anysearch", "exa", "firecrawl"] = "deepseek"
++    adapter: Literal["deepseek", "tavily", "stepsearch_mcp", "anysearch", "exa", "firecrawl", "plugin"] = "deepseek"
+     """服务协议类型，不需要配置模型列表。"""
+ 
+     base_url: str = ""
+@@ -18,6 +18,18 @@
+ 
+     server_ref: str = ""
+     """StepSearch 对应的 bot_config.toml 中 mcp.servers 的名称。"""
++
++    plugin_id: str = ""
++    """plugin 后端的目标插件 ID。凭据由插件管理。"""
++
++    search_api: str = "search"
++    """插件公开的搜索 API 名称。"""
++
++    fetch_api: str = "fetch"
++    """插件公开的正文读取 API 名称。"""
++
++    api_version: str = "1"
++    """插件搜索与正文读取 API 的版本。"""
+ 
+     timeout: float = Field(default=60.0, gt=0, le=300)
+     """单次联网调用的总时限，单位秒。"""
+@@ -40,6 +52,8 @@
+                 raise ValueError("联网服务 base_url 不能包含查询参数或片段")
+         if self.adapter == "stepsearch_mcp" and (self.api_key or self.base_url):
+             raise ValueError("StepSearch MCP 请使用 server_ref，地址和密钥在 MCP 连接中配置")
++        if self.adapter == "plugin" and (self.api_key or self.base_url or self.server_ref):
++            raise ValueError("插件联网请使用 plugin_id 与 API 名称，不能填写地址、密钥或 MCP 连接")
+         super().model_post_init(context)
+ 
+ 
+@@ -94,7 +108,11 @@
+                 service = self.services[selected]
+                 if service.adapter == "stepsearch_mcp" and not service.server_ref.strip():
+                     raise ValueError(f"联网服务 {selected} 缺少 server_ref")
+-                if service.adapter != "stepsearch_mcp" and not service.api_key.strip():
++                if service.adapter == "plugin" and not all(
++                    value.strip() for value in (service.plugin_id, service.search_api, service.fetch_api, service.api_version)
++                ):
++                    raise ValueError(f"联网服务 {selected} 缺少 plugin_id 或 API 名称/版本")
++                if service.adapter not in {"stepsearch_mcp", "plugin"} and not service.api_key.strip():
+                     raise ValueError(f"联网服务 {selected} 缺少 api_key")
+         if self.enabled and not (self.search or self.fetch):
+             raise ValueError("启用联网功能时至少需要选择一个 search 或 fetch 服务")
+--- a/src/web_search/service.py
++++ b/src/web_search/service.py
+@@ -12,6 +12,7 @@
+ from .adapters.deepseek import DeepSeekAdapter
+ from .adapters.exa import ExaAdapter
+ from .adapters.firecrawl import FirecrawlAdapter
++from .adapters.plugin import PluginCaller, PluginWebAdapter
+ from .adapters.stepsearch import MCPCaller, StepSearchAdapter
+ from .adapters.tavily import TavilyAdapter
+ from .config import WebRuntimeConfig
+@@ -30,9 +31,15 @@
+ 
+ 
+ class WebSearchService:
+-    def __init__(self, mcp: MCPCaller, transport: Optional[httpx.AsyncBaseTransport] = None) -> None:
++    def __init__(
++        self,
++        mcp: MCPCaller,
++        transport: Optional[httpx.AsyncBaseTransport] = None,
++        plugin_caller: Optional[PluginCaller] = None,
++    ) -> None:
+         self.mcp = mcp
+         self.transport = transport
++        self.plugin_caller = plugin_caller
+ 
+     async def execute(
+         self,
+@@ -59,6 +66,10 @@
+             adapter = ExaAdapter(settings, self.transport)
+         elif settings.adapter == "firecrawl":
+             adapter = FirecrawlAdapter(settings, self.transport)
++        elif settings.adapter == "plugin":
++            if invocation.metadata.get("plugin_id") == settings.plugin_id:
++                raise WebSearchError("联网后端插件不能再次调用自身提供的统一联网服务")
++            adapter = PluginWebAdapter(settings, self.plugin_caller)
+         else:
+             adapter = StepSearchAdapter(settings, self.mcp, invocation, context)
+         arguments = invocation.arguments
+--- /dev/null
++++ b/src/web_search/adapters/plugin.py
+@@ -0,0 +1,96 @@
++"""通过明确配置的公开插件 API 提供统一搜索与正文读取。"""
++
++from contextvars import ContextVar
++from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
++import asyncio
++import json
++
++from src.web_search.config import WebServiceConfig
++from src.web_search.models import PageResult, SearchHit, SearchResult, WebSearchError
++
++PluginCaller = Callable[[WebServiceConfig, str, Dict[str, Any]], Awaitable[Dict[str, Any]]]
++_active_calls: ContextVar[Tuple[str, ...]] = ContextVar("web_plugin_calls", default=())
++
++
++async def call_plugin_api(config: WebServiceConfig, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
++    """Host 内部显式路由；不允许调用未公开、禁用或名称歧义的 API。"""
++    from src.plugin_runtime.integration import get_plugin_runtime_manager
++
++    runtime = get_plugin_runtime_manager()
++    matches = []
++    for supervisor in runtime.supervisors:
++        entry = supervisor.api_registry.get_api(config.plugin_id, name, version=config.api_version)
++        if entry is not None and entry.public and entry.enabled:
++            matches.append((supervisor, entry))
++    if len(matches) != 1:
++        raise WebSearchError("插件联网 API 不可用，请检查插件启用状态、公开 API 名称和版本")
++    supervisor, entry = matches[0]
++    invoke_args = dict(args)
++    if entry.dynamic:
++        invoke_args.update(
++            __maibot_api_name__=entry.name,
++            __maibot_api_full_name__=entry.full_name,
++            __maibot_api_version__=entry.version,
++        )
++    response = await supervisor.invoke_api(
++        plugin_id=entry.plugin_id,
++        component_name=entry.handler_name,
++        args=invoke_args,
++        timeout_ms=max(1000, int(config.timeout * 1000)),
++    )
++    payload = response.payload
++    if response.error or not isinstance(payload, dict) or payload.get("success") is not True:
++        raise WebSearchError("插件联网 API 调用失败，请检查插件配置、账号权限及用量；上游正文已隐藏")
++    result = payload.get("result")
++    if not isinstance(result, dict):
++        raise WebSearchError("插件联网 API 未返回结构化对象")
++    return result
++
++
++class PluginWebAdapter:
++    def __init__(self, config: WebServiceConfig, caller: Optional[PluginCaller] = None) -> None:
++        self.config = config
++        self.caller = caller or call_plugin_api
++
++    async def call(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
++        key = self.config.plugin_id
++        active = _active_calls.get()
++        if key in active:
++            raise WebSearchError("检测到插件联网递归调用")
++        token = _active_calls.set((*active, key))
++        try:
++            data = await self.caller(self.config, name, args)
++            if not isinstance(data, dict) or len(json.dumps(data, ensure_ascii=False, allow_nan=False)) > 500000:
++                raise WebSearchError("插件联网返回格式无效或超过传输上限")
++            return data
++        except (WebSearchError, asyncio.CancelledError, TimeoutError):
++            raise
++        except Exception:
++            raise WebSearchError("插件联网调用失败；上游响应与内部异常已隐藏") from None
++        finally:
++            _active_calls.reset(token)
++
++    async def search(self, query: str, max_results: int) -> SearchResult:
++        data = await self.call(self.config.search_api, {"query": query, "max_results": max_results})
++        if data.get("content_kind") != "search_results" or not isinstance(data.get("results"), list):
++            raise WebSearchError("插件搜索 API 返回格式错误")
++        hits = []
++        for row in data["results"][:max_results]:
++            if not isinstance(row, dict):
++                raise WebSearchError("插件搜索结果格式错误")
++            hits.append(
++                SearchHit(
++                    title=row["title"],
++                    url=row["url"],
++                    snippet=row["snippet"],
++                    summary=row.get("summary", ""),
++                    published_at=row.get("published_at"),
++                )
++            )
++        return SearchResult(query=query, results=hits)
++
++    async def fetch(self, url: str) -> PageResult:
++        data = await self.call(self.config.fetch_api, {"url": url})
++        if data.get("content_kind") != "page_text":
++            raise WebSearchError("插件读取 API 必须返回真实网页正文 page_text")
++        return PageResult(url=data["url"], title=data["title"], content=data["content"])
+--- a/src/web_search/README.md
++++ b/src/web_search/README.md
+@@ -1,4 +1,32 @@
+ # 联网搜索后端
++
++## 插件联网后端（ChatGPT 桥接等）
++
++`adapter="plugin"` 复用指定插件公开的 API，聊天工具及 `ctx.web.search/fetch` 走相同后端。
++例如安装并授权 ChatGPT 桥接插件后，在插件 `[web]` 开启后端并填写账号可见的搜索模型，再配置：
++
++```toml
++[web.services.gpt_builtin]
++adapter = "plugin"
++plugin_id = "local.chatgpt-maibot-connect"
++search_api = "search"
++fetch_api = "fetch"
++api_version = "1"
++timeout = 270.0
++
++[model_task_config.web_search]
++model_list = ["gpt_builtin"]
++```
++
++插件后端不接受 `api_key/base_url/server_ref`。Host 只调用已启用、公开且版本匹配的 API，
++插件凭据不会经过联网配置。插件必须返回 `content_kind=search_results` 的规范化搜索结果，
++或 `content_kind=page_text` 的真实网页正文；生成的概述不能充当正文。
++超时、取消、API 不可用或调用失败均明确报错，不自动切换到其他服务。
++后端插件不得通过 `ctx.web` 再次调用自身。插件之间的 RPC 使用 Host 原有运行时，
++外层调用组件的超时也应覆盖搜索预算。ChatGPT 桥接插件的内置搜索受账号、模型及工作区策略约束。
++
++搜索摘要可能标记为 `[GPT 生成摘要]`，来源 URL 由托管工具提供；缺少发布时间时保留空值。
++网页读取由插件独立的无凭据客户端执行，静态 HTML/纯文本/Markdown 可用；需浏览器执行脚本的页面可能失败。
+ 
+ 通过 `WebSearchToolProvider` 注册 `web_search(query, max_results=5)` 和 `web_fetch(url)`。
+ 服务选择、协议转换和工具实现均独立于 WebUI。默认未分配，不开放统一联网工具。
+--- a/dashboard/src/routes/config/webSearch/types.ts
++++ b/dashboard/src/routes/config/webSearch/types.ts
+@@ -1,9 +1,20 @@
+-export type WebAdapter = 'deepseek' | 'tavily' | 'stepsearch_mcp' | 'anysearch' | 'exa' | 'firecrawl'
++export type WebAdapter =
++  | 'deepseek'
++  | 'tavily'
++  | 'stepsearch_mcp'
++  | 'anysearch'
++  | 'exa'
++  | 'firecrawl'
++  | 'plugin'
+ 
+ export interface WebServiceConfig {
+   adapter: WebAdapter
+   api_key?: string
+   base_url?: string
++  plugin_id?: string
++  search_api?: string
++  fetch_api?: string
++  api_version?: string
+   server_ref?: string
+   timeout?: number
+   search_depth?: 'basic' | 'advanced' | 'fast' | 'ultra-fast'
+--- a/dashboard/src/routes/config/webSearch/WebSearchDialog.tsx
++++ b/dashboard/src/routes/config/webSearch/WebSearchDialog.tsx
+@@ -43,9 +43,10 @@
+   anysearch: 'AnySearch',
+   exa: 'Exa',
+   firecrawl: 'Firecrawl',
++  plugin: '插件（ChatGPT 等）',
+ }
+ 
+-const HTTP_BASE_URLS: Record<Exclude<WebAdapter, 'stepsearch_mcp'>, string> = {
++const HTTP_BASE_URLS: Record<Exclude<WebAdapter, 'stepsearch_mcp' | 'plugin'>, string> = {
+   deepseek: 'https://api.deepseek.com',
+   tavily: 'https://api.tavily.com',
+   anysearch: 'https://api.anysearch.com',
+@@ -171,8 +172,15 @@
+       setError('服务名称已存在，请使用其他名称')
+       return
+     }
++    if (service.adapter === 'plugin' && !service.plugin_id?.trim()) {
++      setError('请填写已启用的联网插件 ID')
++      return
++    }
+     if (
+-      service.adapter === 'stepsearch_mcp' ? !service.server_ref?.trim() : !service.api_key?.trim()
++      service.adapter !== 'plugin' &&
++      (service.adapter === 'stepsearch_mcp'
++        ? !service.server_ref?.trim()
++        : !service.api_key?.trim())
+     ) {
+       setError(
+         service.adapter === 'stepsearch_mcp'
+@@ -187,7 +195,11 @@
+       setError('超时时间应大于 0 且不超过 300 秒')
+       return
+     }
+-    if (service.adapter !== 'stepsearch_mcp' && service.base_url?.trim()) {
++    if (
++      service.adapter !== 'stepsearch_mcp' &&
++      service.adapter !== 'plugin' &&
++      service.base_url?.trim()
++    ) {
+       try {
+         const url = new URL(service.base_url.trim())
+         if (
+@@ -208,25 +220,34 @@
+       Object.entries(config.services).filter(([key]) => key !== editingName)
+     )
+     const cleaned: WebServiceConfig =
+-      service.adapter === 'stepsearch_mcp'
++      service.adapter === 'plugin'
+         ? {
+-            adapter: service.adapter,
+-            server_ref: service.server_ref!.trim(),
++            adapter: 'plugin',
++            plugin_id: service.plugin_id!.trim(),
++            search_api: service.search_api?.trim() || 'search',
++            fetch_api: service.fetch_api?.trim() || 'fetch',
++            api_version: service.api_version?.trim() || '1',
+             timeout: service.timeout,
+-            category: service.category ?? '',
+           }
+-        : {
+-            adapter: service.adapter,
+-            api_key: service.api_key!.trim(),
+-            base_url: service.base_url?.trim() ?? '',
+-            timeout: service.timeout,
+-            ...(service.adapter === 'tavily'
+-              ? {
+-                  search_depth: service.search_depth ?? 'basic',
+-                  extract_depth: service.extract_depth ?? 'basic',
+-                }
+-              : {}),
+-          }
++        : service.adapter === 'stepsearch_mcp'
++          ? {
++              adapter: service.adapter,
++              server_ref: service.server_ref!.trim(),
++              timeout: service.timeout,
++              category: service.category ?? '',
++            }
++          : {
++              adapter: service.adapter,
++              api_key: service.api_key!.trim(),
++              base_url: service.base_url?.trim() ?? '',
++              timeout: service.timeout,
++              ...(service.adapter === 'tavily'
++                ? {
++                    search_depth: service.search_depth ?? 'basic',
++                    extract_depth: service.extract_depth ?? 'basic',
++                  }
++                : {}),
++            }
+     const next = {
+       ...config,
+       services: { ...services, [nextName]: cleaned },
+@@ -283,6 +304,15 @@
+                     api_key: provider?.api_key ?? '',
+                     base_url: provider?.base_url ?? '',
+                     server_ref: '',
++                    ...(adapter === 'plugin'
++                      ? {
++                          plugin_id: 'local.chatgpt-maibot-connect',
++                          search_api: 'search',
++                          fetch_api: 'fetch',
++                          api_version: '1',
++                          timeout: 270,
++                        }
++                      : {}),
+                   })
+                 }}
+               >
+@@ -339,7 +369,43 @@
+                 )}
+               </div>
+             )}
+-            {service.adapter === 'stepsearch_mcp' ? (
++            {service.adapter === 'plugin' ? (
++              <div className="grid gap-2">
++                <Label htmlFor="web-plugin-id">联网插件</Label>
++                <Input
++                  id="web-plugin-id"
++                  value={service.plugin_id ?? ''}
++                  onChange={(event) => patch({ plugin_id: event.target.value })}
++                  placeholder="local.chatgpt-maibot-connect"
++                />
++                <p className="text-muted-foreground text-xs">
++                  请先启用桥接插件的统一联网功能，并在插件设置中选择搜索模型。账号授权由插件管理。
++                </p>
++                <details className="rounded-md border p-3">
++                  <summary className="cursor-pointer text-sm">自定义插件接口</summary>
++                  <div className="mt-3 grid gap-2">
++                    <Label htmlFor="web-plugin-search">搜索接口</Label>
++                    <Input
++                      id="web-plugin-search"
++                      value={service.search_api ?? 'search'}
++                      onChange={(event) => patch({ search_api: event.target.value })}
++                    />
++                    <Label htmlFor="web-plugin-fetch">正文读取接口</Label>
++                    <Input
++                      id="web-plugin-fetch"
++                      value={service.fetch_api ?? 'fetch'}
++                      onChange={(event) => patch({ fetch_api: event.target.value })}
++                    />
++                    <Label htmlFor="web-plugin-version">接口版本</Label>
++                    <Input
++                      id="web-plugin-version"
++                      value={service.api_version ?? '1'}
++                      onChange={(event) => patch({ api_version: event.target.value })}
++                    />
++                  </div>
++                </details>
++              </div>
++            ) : service.adapter === 'stepsearch_mcp' ? (
+               <div className="grid gap-2">
+                 <Label htmlFor="web-service-server">已有 MCP 连接</Label>
+                 <Input
+--- /dev/null
++++ b/pytests/web_search/test_plugin_backend.py
+@@ -0,0 +1,159 @@
++"""插件搜索的实际 Host 路由、SDK 能力与结果预览契约。"""
++
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++import asyncio
++import sys
++
++import pytest
++
++from src.core.tooling import ToolInvocation
++from src.plugin_runtime.capabilities import web
++from src.plugin_runtime.host.api_registry import APIRegistry
++from src.web_search.adapters.plugin import call_plugin_api
++from src.web_search.config import WebRuntimeConfig
++from src.web_search.models import WebSearchError
++from src.web_search.provider import WebSearchToolProvider
++from src.web_search.service import WebSearchService
++
++
++def config():
++    return WebRuntimeConfig(
++        enabled=True,
++        search="gpt",
++        fetch="gpt",
++        services={"gpt": {"adapter": "plugin", "plugin_id": "local.chatgpt-maibot-connect", "timeout": 270}},
++    )
++
++
++@pytest.fixture
++def runtime(monkeypatch):
++    registry = APIRegistry()
++    registry.register_api(
++        "search", "local.chatgpt-maibot-connect", {"public": True, "version": "1", "handler_name": "search_handler"}
++    )
++    registry.register_api(
++        "fetch", "local.chatgpt-maibot-connect", {"public": True, "version": "1", "handler_name": "fetch_handler"}
++    )
++    supervisor = SimpleNamespace(api_registry=registry, invoke_api=AsyncMock())
++    monkeypatch.setitem(
++        sys.modules,
++        "src.plugin_runtime.integration",
++        SimpleNamespace(get_plugin_runtime_manager=lambda: SimpleNamespace(supervisors=[supervisor])),
++    )
++    return supervisor
++
++
++def response(data):
++    return SimpleNamespace(error=None, payload={"success": True, "result": data})
++
++
++def search_result():
++    return {
++        "content_kind": "search_results",
++        "results": [
++            {
++                "title": "来源",
++                "url": "https://example.com",
++                "snippet": "[GPT 生成摘要] 资料",
++                "summary": "[GPT 生成摘要] 资料",
++                "published_at": None,
++            }
++        ],
++    }
++
++
++@pytest.mark.asyncio
++async def test_chat_and_mailife_capability_use_same_plugin_route(runtime, monkeypatch):
++    runtime.invoke_api.return_value = response(search_result())
++    service = WebSearchService(None)
++    settings = config()
++    provider = WebSearchToolProvider(service, lambda: settings)
++    result = await provider.invoke(ToolInvocation(tool_name="web_search", session_id="chat", arguments={"query": "q"}))
++    assert result.success and result.structured_content["results"][0]["published_at"] is None
++    assert "result_id" in result.structured_content
++    monkeypatch.setattr(web, "get_config", lambda: settings)
++    monkeypatch.setattr(web, "get_service", lambda: service)
++    capability = await web.call("maibot-community.mai-life", "web.search", {"query": "q", "max_results": 2})
++    assert capability["result"]["results"][0]["snippet"] == "[GPT 生成摘要] 资料"
++    assert "result_id" not in capability["result"]
++    args = runtime.invoke_api.await_args.kwargs
++    assert args["plugin_id"] == "local.chatgpt-maibot-connect"
++    assert args["component_name"] == "search_handler"
++    assert args["timeout_ms"] == 270000
++    assert args["args"] == {"query": "q", "max_results": 2}
++
++
++@pytest.mark.asyncio
++async def test_page_text_is_passed_without_model_summarization(runtime):
++    runtime.invoke_api.return_value = response(
++        {"content_kind": "page_text", "url": "https://example.com", "title": "Page", "content": "真实正文" * 2000}
++    )
++    result = await WebSearchService(None).execute(
++        config(), ToolInvocation(tool_name="web_fetch", arguments={"url": "https://example.com"})
++    )
++    assert result.content == "真实正文" * 2000
++    assert runtime.invoke_api.await_args.kwargs["component_name"] == "fetch_handler"
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("public,enabled", [(False, True), (True, False)])
++async def test_private_and_disabled_apis_are_not_invoked(runtime, public, enabled):
++    entry = runtime.api_registry.get_api("local.chatgpt-maibot-connect", "search", version="1")
++    entry.public, entry.enabled = public, enabled
++    with pytest.raises(WebSearchError, match="不可用"):
++        await call_plugin_api(config().services["gpt"], "search", {"query": "q"})
++    runtime.invoke_api.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_backend_itself_cannot_reenter_ctx_web(runtime):
++    with pytest.raises(WebSearchError, match="自身"):
++        await WebSearchService(None).execute(
++            config(),
++            ToolInvocation(
++                tool_name="web_search", arguments={"query": "q"}, metadata={"plugin_id": "local.chatgpt-maibot-connect"}
++            ),
++        )
++    runtime.invoke_api.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "payload",
++    [
++        SimpleNamespace(error={"message": "SECRET TOKEN"}, payload={}),
++        SimpleNamespace(error=None, payload={"success": False, "result": "SECRET TOKEN"}),
++        response({"content_kind": "page_summary", "content": "generated"}),
++    ],
++)
++async def test_plugin_failures_and_generated_page_summaries_are_rejected(runtime, payload):
++    runtime.invoke_api.return_value = payload
++    with pytest.raises(WebSearchError) as caught:
++        await WebSearchService(None).execute(
++            config(), ToolInvocation(tool_name="web_fetch", arguments={"url": "https://example.com"})
++        )
++    assert "SECRET" not in str(caught.value)
++
++
++@pytest.mark.asyncio
++async def test_empty_search_is_success_and_timeout_cancels():
++    caller = AsyncMock(return_value={"content_kind": "search_results", "results": []})
++    service = WebSearchService(None, plugin_caller=caller)
++    assert (
++        await service.execute(config(), ToolInvocation(tool_name="web_search", arguments={"query": "q"}))
++    ).results == []
++    cancelled = asyncio.Event()
++
++    async def slow(*args):
++        try:
++            await asyncio.Event().wait()
++        finally:
++            cancelled.set()
++
++    caller.side_effect = slow
++    settings = config()
++    settings.services["gpt"].timeout = 0.01
++    with pytest.raises(WebSearchError, match="超过"):
++        await service.execute(settings, ToolInvocation(tool_name="web_search", arguments={"query": "q"}))
++    assert cancelled.is_set()
+--- a/changelogs/changelog.md
++++ b/changelogs/changelog.md
+@@ -1,4 +1,15 @@
+ # 更新日志
++
++## 本地改动：插件联网后端
++
++### 主要功能
++
++- 联网：新增插件后端，通过公开插件 API 统一提供聊天搜索、网页正文读取与 SDK `ctx.web` 能力，支持 ChatGPT 桥接插件。
++
++### 细节与修复
++
++- 联网配置：插件后端不要求搜索 API Key，凭据由目标插件管理；调用保留超时、取消及明确失败语义。
++- WebUI：联网服务增加插件选项与目标插件设置。
+ 
+ # [1.3.19] - 2026-10-29
+ 

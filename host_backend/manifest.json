@@ -1,0 +1,41 @@
+{
+  "base_commit": "c6429547af711555e3d4d1b8d04b413572cb616c",
+  "base_version": "1.3.19",
+  "files": [
+    {
+      "path": "src/config/config.py",
+      "base_sha256": "4fcbde2a6fd2c82ee5084a53dea946ef1316822e7a8f0241620d8b7dc52346b2",
+      "sha256": "63a6ab2316e81d5f5c9b4f9fabe4f41560a31728b2c99e494ec79a0bd1a2c0fd"
+    },
+    {
+      "path": "src/web_search/config.py",
+      "base_sha256": "3851c53930f0f588356598290dccf5e4ad1da78c551fac35a2d5b2611407f2c3",
+      "sha256": "e6a16c74ecf1a9cc5fd8db114af9efed58db1d9ac41988c989a09ac60405bd55"
+    },
+    {
+      "path": "src/web_search/service.py",
+      "base_sha256": "107802383c38f77b8c831c43633bf6a913659b7ecbe00826313b0ff8ac09884d",
+      "sha256": "d50555e5323cb80391116b43a9481e1a6c41671b55eca02c731c07ccc8e96529"
+    },
+    {
+      "path": "src/web_search/adapters/plugin.py",
+      "base_sha256": null,
+      "sha256": "84cfc53ab044677e0f0e792dbf34bf98cd8d0e824784884407fac99cb814c859"
+    },
+    {
+      "path": "src/web_search/README.md",
+      "base_sha256": "85ea0eeb6a51cf9c4f05b2ceb8109aa1b01b8238e79f57ea2eed4aad01bfd75f",
+      "sha256": "ccf1b8cfa21c80d9b2a54b8ea7e92a856aa61ba07bc3b3d910280534d784c3db"
+    },
+    {
+      "path": "dashboard/src/routes/config/webSearch/types.ts",
+      "base_sha256": "540655e272034561d907a18aac46ea512e3e195765cf67ad949b1c5c54a27699",
+      "sha256": "c63cc249ec13d71690bd9fa2aaabc53ffb7f2fc361542244eb8177940c7c94ba"
+    },
+    {
+      "path": "dashboard/src/routes/config/webSearch/WebSearchDialog.tsx",
+      "base_sha256": "48ba0b0fcd9ae9f3512f9f311a7a7637a4c435e25079b4ab364264ee7721cff0",
+      "sha256": "fdf8651f4cc8d1ee7a00427a6e292d11ce061e78c4bcee2816685b17f717cbd6"
+    }
+  ]
+}
